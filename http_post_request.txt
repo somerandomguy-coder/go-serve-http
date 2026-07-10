@@ -1,0 +1,11 @@
+POST /api/users HTTP/1.1
+Host: ://example.com
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)
+Content-Type: application/json
+Content-Length: 47
+Connection: keep-alive
+
+{
+  "username": "johndoe",
+  "email": "john@example.com"
+}
