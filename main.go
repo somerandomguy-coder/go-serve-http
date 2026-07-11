@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -61,10 +60,8 @@ func main() {
 	}
 }
 
-func handleClient(con net.Conn) {
-	contents, err := parseHTTPWithFTM(con)
-	if err != nil {
-		errorResponse := fmt.Sprintf(`HTTP/1.1 500 Internal Server Error
+func createServerErrorRepsponse(err error) []byte {
+	result := fmt.Sprintf(`HTTP/1.1 500 Internal Server Error
 Date: Fri, 10 Jul 2026 01:07:00 GMT
 Content-Type: application/json; charset=UTF-8
 Content-Length: %d
@@ -75,26 +72,31 @@ Connection: close
   "message": "%s"
 }
 `, 53+len(err.Error()), err)
-		_, err = con.Write([]byte(errorResponse))
+	return []byte(result)
+}
+
+func createOKResponse() []byte {
+	return []byte(`HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 41
+
+{"status": "success", "message": "hello"}`)
+}
+
+func handleClient(con net.Conn) {
+	contents, err := parseHTTPWithFTM(con)
+	if err != nil {
+		errorResponse := createServerErrorRepsponse(err)
+		_, err = con.Write(errorResponse)
 		if err != nil {
 			_, _ = fmt.Printf("can't send response, err: %s", err)
 			return
 		}
 	}
-	response := `HTTP/1.1 200 OK
-Content-Type: application/json
-Content-Length: 41
-
-{"status": "success", "message": "hello"}`
-	_, err = con.Write([]byte(response))
-	if err != nil {
-		_, _ = fmt.Printf("can't send response, err: %s", err)
-		return
-	}
 
 	fmt.Printf("Request: %#v\n", contents)
 
-	allowedMethod := []string{"GET", "POST"}
+	allowedMethod := []string{"GET", "POST", "QUERY"}
 	method := contents.RequestLine.Method
 
 	if !slices.Contains(allowedMethod, method) {
@@ -103,6 +105,33 @@ Content-Length: 41
 	}
 
 	fmt.Printf("body is: %v\n", contents.Body)
+
+	err = handleWebsocketCon(contents)
+	if err != nil {
+		errorResponse := createServerErrorRepsponse(err)
+		_, err = con.Write(errorResponse)
+		if err != nil {
+			_, _ = fmt.Printf("can't send response, err: %s", err)
+			return
+		}
+	}
+
+	// responding
+	response := createOKResponse()
+
+	_, err = con.Write(response)
+	if err != nil {
+		_, _ = fmt.Printf("can't send response, err: %s", err)
+		return
+	}
+}
+
+func handleWebsocketCon(request Request) error {
+	method := request.RequestLine.Method
+	if method != "GET" {
+		return fmt.Errorf("method not allowed for websocket: %s, expedted GET", method)
+	}
+	return nil
 }
 
 func parseHTTPWithFTM(con net.Conn) (Request, error) {
@@ -181,11 +210,11 @@ OuterLoop:
 				case '\r':
 					s = expectLF
 
-					if len(fields["Content-Length"]) > 0 {
-						if strings.Contains(fields["Content-Type"], "json") || fields["Content-Type"] == "*/*" {
+					if len(fields["content-length"]) > 0 {
+						if strings.Contains(fields["content-type"], "json") || fields["content-type"] == "*/*" {
 							nextState = parseBodyJSON
 							continue StateMachineLoop
-						} else if strings.Contains(fields["Content-Type"], "image") {
+						} else if strings.Contains(fields["content-type"], "image") {
 							nextState = parseBodyImageBin
 							continue StateMachineLoop
 						}
@@ -212,7 +241,8 @@ OuterLoop:
 
 			case parseValue:
 				if char == '\r' {
-					fields[key] = strings.TrimSpace(string(readBuffer)) //trim optional leading and trailing whitespace
+					// header name is case-insensitive
+					fields[strings.ToLower(key)] = strings.TrimSpace(string(readBuffer)) //trim optional leading and trailing whitespace
 					readBuffer = []byte{}
 					s = expectLF
 					nextState = parseKey //state after the next state
@@ -239,7 +269,7 @@ OuterLoop:
 			case parseBodyImageBin:
 				imageBody = append(imageBody, char)
 				bodyRead += 1
-				contentLength, err := strconv.Atoi(fields["Content-Length"])
+				contentLength, err := strconv.Atoi(fields["content-length"])
 				if err != nil {
 					return Request{}, err
 				}
@@ -254,7 +284,7 @@ OuterLoop:
 					if err != nil {
 						return Request{}, err
 					}
-					contentType := fields["Content-Type"]
+					contentType := fields["content-type"]
 					_, extension, found := strings.Cut(contentType, "/")
 
 					if !found {
@@ -290,65 +320,4 @@ func generateHexKey(length int) (string, error) {
 
 	// Hex encoding doubles the length (e.g., 16 bytes becomes a 32-character string)
 	return hex.EncodeToString(bytes), nil
-}
-
-func parseHTTP(con net.Conn) (map[string]any, error) {
-	fmt.Println("parsing nowwww")
-	buffer := make([]uint8, 1000)
-	result := map[string]any{}
-	for {
-		bytes, err := con.Read(buffer)
-		if bytes <= 0 {
-			break
-		}
-		if err != nil {
-			_, _ = fmt.Printf("can't read file, err: %s", err)
-			return nil, nil
-		}
-
-		// split header and body
-		head, body, found := strings.Cut(string(buffer[:bytes]), "\r\n\r\n")
-		if !found {
-			return map[string]any{}, errors.New("unproper protocol message")
-		}
-
-		startLine, header, found := strings.Cut(head, "\r\n")
-		if !found {
-			return map[string]any{}, errors.New("unproper protocol message")
-		}
-
-		//parse startline
-		keyFields := strings.Split(startLine, " ")
-		method := keyFields[0]
-		result["Method"] = method
-		route := keyFields[1]
-		result["Route"] = route
-		version := keyFields[2]
-		result["Version"] = version
-
-		//parse header
-		for value := range strings.SplitSeq(header, "\r\n") {
-			fields := strings.Split(value, ": ")
-			fieldKey := fields[0]
-			fieldValue := strings.Join(fields[1:], " ")
-			result[fieldKey] = fieldValue
-		}
-
-		//parse body
-		contentLength := result["Content-Length"]
-		if contentLength != nil {
-			bodyMap := map[string]any{}
-			if err := json.Unmarshal([]byte(body), &bodyMap); err != nil {
-				_, _ = fmt.Printf("error while parsing json. Error: %s", err)
-				return nil, nil
-			}
-			result["Body"] = bodyMap
-		} else {
-			fmt.Println("endparsing-------")
-			return result, nil
-		}
-
-	}
-	fmt.Println("endparsing-------")
-	return result, nil
 }
