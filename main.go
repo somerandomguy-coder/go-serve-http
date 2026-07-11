@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,8 +14,6 @@ import (
 	"strconv"
 	"strings"
 )
-
-type STATE int
 
 type RequestLine struct {
 	HTTPVersion   string
@@ -25,6 +26,17 @@ type Request struct {
 	Header      map[string]string
 	Body        map[string]any
 }
+
+type WebsocketFrame struct {
+	IsFinal bool
+	OpCode  byte
+	IsMask  bool
+	Length  uint64
+	MaskKey [4]byte
+	PayLoad []byte
+}
+
+type STATE int
 
 const (
 	parseMethod STATE = iota
@@ -39,14 +51,28 @@ const (
 	end
 )
 
+type FRAMESTATE int
+
+const (
+	parseFin FRAMESTATE = iota
+	parseOpCode
+	parseMask
+	parseLength
+	parseLength16
+	parseLength64
+	parseFrameKey
+	parsePayload
+	endFrame
+)
+
 const UploadImagesFolder = "upload_images"
 const FileNameLength = 8
+const HOST = "localhost:8080"
 
 func main() {
 	fmt.Println("Hello, World!")
-	const ADDR = "localhost:8080"
-	fmt.Printf("Server listen on: %s\n", ADDR)
-	server, _ := net.Listen("tcp", ADDR)
+	fmt.Printf("Server listen on: %s\n", HOST)
+	server, _ := net.Listen("tcp", HOST)
 
 	for {
 		connection, err := server.Accept()
@@ -72,6 +98,21 @@ Connection: close
   "message": "%s"
 }
 `, 53+len(err.Error()), err)
+	return []byte(result)
+}
+
+func createBadRequestRepsponse(err error) []byte {
+	result := fmt.Sprintf(`HTTP/1.1 401 Unauthorized
+Date: Sun, 12 Jul 2026 00:09:00 GMT
+Content-Type: application/json; charset=utf-8
+Content-Length: %d
+WWW-Authenticate: Bearer realm="://example.com", error="invalid_token"
+
+{
+  "error": "unauthorized",
+  "message": "%s"
+}
+`, 46+len(err.Error()), err)
 	return []byte(result)
 }
 
@@ -106,12 +147,11 @@ func handleClient(con net.Conn) {
 
 	fmt.Printf("body is: %v\n", contents.Body)
 
-	err = handleWebsocketCon(contents)
-	if err != nil {
-		errorResponse := createServerErrorRepsponse(err)
-		_, err = con.Write(errorResponse)
-		if err != nil {
-			_, _ = fmt.Printf("can't send response, err: %s", err)
+	connection, ok := contents.Header["connection"]
+	if ok {
+		if connection == "Upgrade" {
+			_ = handleUpgradeConnection(contents, con)
+			//hand off the connection to the upgraded one
 			return
 		}
 	}
@@ -126,12 +166,214 @@ func handleClient(con net.Conn) {
 	}
 }
 
-func handleWebsocketCon(request Request) error {
-	method := request.RequestLine.Method
-	if method != "GET" {
-		return fmt.Errorf("method not allowed for websocket: %s, expedted GET", method)
+func handleUpgradeConnection(request Request, con net.Conn) error {
+	upgrade, ok := request.Header["upgrade"]
+	if !ok {
+		return fmt.Errorf("need to specify the upgrade protocol name")
+	}
+	if upgrade == "websocket" {
+		code, err := handleWebsocketCon(request, con)
+		if err != nil {
+			errorResponse := []byte{}
+			fmt.Println(string(errorResponse))
+			if code == 401 {
+				errorResponse = createBadRequestRepsponse(err)
+			} else {
+				errorResponse = createServerErrorRepsponse(err)
+			}
+			_, err = con.Write(errorResponse)
+			if err != nil {
+				_, _ = fmt.Printf("can't send response, err: %s", err)
+				return err
+			}
+		}
+	} else {
+		return fmt.Errorf("upgrade protocol not allowed: %s", upgrade)
 	}
 	return nil
+}
+
+func handleWebsocketCon(request Request, con net.Conn) (int, error) {
+	method := request.RequestLine.Method
+	if method != "GET" {
+		return 401, fmt.Errorf("method not allowed for websocket: %s, expedted GET", method)
+	}
+	header := request.Header
+	host, ok := header["host"]
+	if !ok {
+		return 401, fmt.Errorf("missing header, expected host")
+	}
+	secWebSocketKey, ok := header["sec-websocket-key"]
+	if !ok {
+		return 401, fmt.Errorf("missing header, expected sec-websocket-key")
+	}
+	secWebSocketVersion, ok := header["sec-websocket-version"]
+	if !ok {
+		return 401, fmt.Errorf("missing header, expected sec-websocket-version")
+	}
+
+	if host != HOST {
+		return 401, fmt.Errorf("connect to wrong host")
+	}
+
+	if !isValidBase64([]byte(secWebSocketKey)) {
+		return 401, fmt.Errorf("websocket key is not a valid base64")
+	}
+
+	if secWebSocketVersion != "13" {
+		return 401, fmt.Errorf("websocket version is not supported")
+	}
+
+	fmt.Println("succesfully validate the request")
+
+	magicString := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	concatenateString := secWebSocketKey + magicString
+	sha1Hash := sha1.Sum([]byte(concatenateString))
+	base64Encode := base64.StdEncoding.EncodeToString(sha1Hash[:])
+	response := createWebSocketOKResponse(base64Encode)
+	_, err := con.Write(response)
+	if err != nil {
+		_, _ = fmt.Printf("can't send response, err: %s", err)
+		return 500, err
+	}
+
+	frame, err := parseWebsocketFrame(con)
+	if err != nil {
+		return 500, err
+	}
+
+	fmt.Printf("frame is %+v", frame)
+
+	return 200, nil
+}
+
+func parseWebsocketFrame(con net.Conn) (WebsocketFrame, error) {
+	fmt.Println("Start parsing websocketframe")
+	endParsing := false
+	frame := WebsocketFrame{}
+	readBuffer := make([]byte, 1024)
+	s := parseFin
+	var cumLength uint64 = 0
+	count := 0
+	maskKey := [4]byte{}
+	keyCount := 0
+	rest := 0
+	cumPayload := []byte{}
+
+ReadBufferLoop:
+	for !endParsing {
+		bytes, err := con.Read(readBuffer)
+		if err != nil {
+			return WebsocketFrame{}, err
+		}
+		i := 0
+		for i < bytes {
+			char := readBuffer[i]
+			switch s {
+			case parseFin:
+				// get the first bit
+				fin := char >> 7
+				frame.IsFinal = (fin == 0x01)
+				s = parseOpCode
+				continue
+			case parseOpCode:
+				// get the last 4 bits
+				opcode := char & 0b00001111
+				frame.OpCode = opcode
+				s = parseMask
+
+			case parseMask:
+				mask := char >> 7
+				frame.IsMask = (mask == 0x01)
+				s = parseLength
+				continue // continue to reuse the same byte (for next parsing step)
+			case parseLength:
+				length := char & 0b01111111
+				if length < 126 {
+					frame.Length = uint64(length)
+					rest = int(frame.Length)
+					s = parseFrameKey
+				} else if length == 126 {
+					s = parseLength16
+					cumLength = 0
+				} else {
+					s = parseLength64
+					cumLength = 0
+				}
+			case parseLength16:
+				count += 1
+				cumLength = (cumLength << 8) | uint64(char)
+
+				if count == 2 {
+					s = parseFrameKey
+					frame.Length = cumLength
+					rest = int(frame.Length)
+				}
+			case parseLength64:
+				count += 1
+				cumLength = (cumLength << 8) | uint64(char)
+
+				if count == 8 {
+					s = parseFrameKey
+					frame.Length = cumLength
+					rest = int(frame.Length)
+				}
+
+			case parseFrameKey:
+				if !frame.IsMask {
+					frame.MaskKey = [4]byte{}
+					s = parsePayload
+				} else {
+					key := char
+					maskKey[keyCount] = key
+					keyCount += 1
+					if keyCount == 4 {
+						frame.MaskKey = maskKey
+						s = parsePayload
+					}
+				}
+
+			case parsePayload:
+				bytesLeft := bytes - i
+				if rest > bytesLeft {
+					rest = rest - bytesLeft
+					cumPayload = append(cumPayload, readBuffer[i:]...)
+					continue ReadBufferLoop
+				} else {
+					cumPayload = append(cumPayload, readBuffer[i:i+rest]...)
+					frame.PayLoad = cumPayload
+					fmt.Println("End now")
+					endParsing = true
+				}
+			}
+			i++
+		}
+	}
+	return frame, nil
+}
+
+func createWebSocketOKResponse(base64Encode string) []byte {
+	result := fmt.Sprintf(`HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: %s
+Sec-WebSocket-Protocol: chat
+`, base64Encode)
+	return []byte(result)
+}
+
+func isValidBase64(key []byte) bool {
+	//simple check (idc if they have special character)
+
+	if len(key) != 24 {
+		return false
+	}
+	if !bytes.HasSuffix(key, []byte("==")) {
+		return false
+	}
+
+	return true
+
 }
 
 func parseHTTPWithFTM(con net.Conn) (Request, error) {

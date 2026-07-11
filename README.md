@@ -25,3 +25,13 @@ POST request with raw binary image body:
 ```console
 curl --data-binary @{YOUR_IMAGE_PATH} -H "Content-Type: image/jpeg" localhost:8080
 ```
+
+WEBSOCKET request: 
+
+```console
+curl -v -X GET http://localhost:8080 \
+  -H "Connection: Upgrade" \
+  -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  -H "Sec-WebSocket-Version: 13"
+```
