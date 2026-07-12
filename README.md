@@ -26,7 +26,7 @@ POST request with raw binary image body:
 curl --data-binary @{YOUR_IMAGE_PATH} -H "Content-Type: image/jpeg" localhost:8080
 ```
 
-WEBSOCKET request: 
+WEBSOCKET request (test request): 
 
 ```console
 curl -v -X GET http://localhost:8080 \
@@ -35,3 +35,19 @@ curl -v -X GET http://localhost:8080 \
   -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
   -H "Sec-WebSocket-Version: 13"
 ```
+
+WEBSOCKET request (interactive): 
+required: websocat 
+for fedora: 
+```
+sudo dnf copr enable atim/websocat -y
+sudo dnf install websocat -y
+```
+
+then run 
+```
+websocat ws://localhost:8080
+```
+then chat and the server will receive the message
+
+press Ctrl+D to send close opcode and close connection
