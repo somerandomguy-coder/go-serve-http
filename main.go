@@ -14,6 +14,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 type RequestLine struct {
@@ -37,10 +39,10 @@ type WebsocketFrame struct {
 	PayLoad []byte
 }
 
-type STATE int
+type state int
 
 const (
-	parseMethod STATE = iota
+	parseMethod state = iota
 	parseResource
 	parseVersion
 	parseKey
@@ -52,10 +54,10 @@ const (
 	end
 )
 
-type FRAMESTATE int
+type frameState int
 
 const (
-	parseFin FRAMESTATE = iota
+	parseFin frameState = iota
 	parseOpCode
 	parseMask
 	parseLength
@@ -66,20 +68,43 @@ const (
 	endFrame
 )
 
+const (
+	OpContinuation byte = 0x00
+	OpText         byte = 0x01
+	OpBinary       byte = 0x02
+	OpClose        byte = 0x08
+	OpPing         byte = 0x09
+	OpPong         byte = 0x0A
+)
+
+// Create a global pool for 1024-byte buffers
+var bufferPool = sync.Pool{
+	New: func() any {
+		// This runs only when the pool is completely empty
+		b := make([]byte, 1024)
+		return &b // Return a pointer to avoid copying the slice header
+	},
+}
+
 const UploadImagesFolder = "upload_images"
 const FileNameLength = 8
-const HOST = "localhost:8080"
+const Host = "localhost:8080"
 
 func main() {
 	fmt.Println("Hello, World!")
-	fmt.Printf("Server listen on: %s\n", HOST)
-	server, _ := net.Listen("tcp", HOST)
+	fmt.Printf("Server listen on: %s\n", Host)
+	server, err := net.Listen("tcp", Host)
+	if err != nil {
+		fmt.Printf("failed to bind to %s: %s", Host, err)
+		os.Exit(1)
+	}
 
 	for {
 		connection, err := server.Accept()
 		if err != nil {
-			_, _ = fmt.Printf("can't open file, err: %s", err)
-			return
+			fmt.Printf("can't open file, err: %s", err)
+			// if err just continue
+			continue
 		}
 
 		go handleClient(connection)
@@ -88,67 +113,75 @@ func main() {
 }
 
 func createWebSocketOKResponse(base64Encode string) []byte {
+	// Generates: "Sun, 12 Jul 2026 13:45:00 GMT"
+	dateStr := time.Now().UTC().Format(time.RFC1123)
 	// Double quotes allow \r\n escape characters.
 	// Note the double \r\n\r\n at the very end to signal the end of HTTP headers.
 	result := fmt.Sprintf(
 		"HTTP/1.1 101 Switching Protocols\r\n"+
+			"Date: %s\r\n"+
 			"Upgrade: websocket\r\n"+
 			"Connection: Upgrade\r\n"+
 			"Sec-WebSocket-Accept: %s\r\n"+
 			"Sec-WebSocket-Protocol: chat\r\n\r\n",
-		base64Encode,
+		dateStr, base64Encode,
 	)
 	return []byte(result)
 }
 
 func createServerErrorResponse(err error) []byte {
+	// Generates: "Sun, 12 Jul 2026 13:45:00 GMT"
+	dateStr := time.Now().UTC().Format(time.RFC1123)
 	// It is safer to generate the JSON body first, then calculate its exact length dynamically.
 	body := fmt.Sprintf(`{"error": "InternalServerError", "message": "%s"}`, err.Error())
 
 	result := fmt.Sprintf(
 		"HTTP/1.1 500 Internal Server Error\r\n"+
-			"Date: Fri, 10 Jul 2026 01:07:00 GMT\r\n"+
+			"Date: %s\r\n"+
 			"Content-Type: application/json; charset=UTF-8\r\n"+
 			"Content-Length: %d\r\n"+
 			"Connection: close\r\n\r\n"+
 			"%s",
-		len(body), body,
+		dateStr, len(body), body,
 	)
 	return []byte(result)
 }
-
 func createBadRequestResponse(err error) []byte {
-	body := fmt.Sprintf(`{"error": "unauthorized", "message": "%s"}`, err.Error())
+	// Generates: "Sun, 12 Jul 2026 13:45:00 GMT"
+	dateStr := time.Now().UTC().Format(time.RFC1123)
+	body := fmt.Sprintf(`{"error": "BadRequest", "message": "%s"}`, err.Error())
 
 	result := fmt.Sprintf(
-		"HTTP/1.1 401 Unauthorized\r\n"+
-			"Date: Sun, 12 Jul 2026 00:09:00 GMT\r\n"+
+		"HTTP/1.1 400 Bad Request\r\n"+
+			"Date: %s\r\n"+
 			"Content-Type: application/json; charset=utf-8\r\n"+
 			"Content-Length: %d\r\n"+
-			"WWW-Authenticate: Bearer realm=\"://example.com\", error=\"invalid_token\"\r\n\r\n"+
+			"Connection: close\r\n\r\n"+
 			"%s",
-		len(body), body,
+		dateStr, len(body), body,
 	)
 	return []byte(result)
 }
 
 func createOKResponse() []byte {
+	// Generates: "Sun, 12 Jul 2026 13:45:00 GMT"
+	dateStr := time.Now().UTC().Format(time.RFC1123)
 	body := `{"status": "success", "message": "hello"}`
 
 	result := fmt.Sprintf(
 		"HTTP/1.1 200 OK\r\n"+
+			"Date: %s\r\n"+
 			"Content-Type: application/json\r\n"+
 			"Content-Length: %d\r\n\r\n"+
 			"%s",
-		len(body), body,
+		dateStr, len(body), body,
 	)
 	return []byte(result)
 }
 
 func handleClient(con net.Conn) {
-	contents, err := parseHTTPWithFTM(con)
+	contents, err := parseHTTPWithFSM(con)
 	if err != nil {
-
 		errorResponse := createServerErrorResponse(err)
 		_, err = con.Write(errorResponse)
 		if err != nil {
@@ -194,7 +227,7 @@ func handleClient(con net.Conn) {
 	}
 }
 
-func handleUpgradeConnection(request Request, con net.Conn) error {
+func handleUpgradeConnection(request *Request, con net.Conn) error {
 	upgrade, ok := request.Header["upgrade"]
 	if !ok {
 		return fmt.Errorf("need to specify the upgrade protocol name")
@@ -204,39 +237,32 @@ func handleUpgradeConnection(request Request, con net.Conn) error {
 		if err != nil {
 			errorResponse := []byte{}
 			fmt.Println(string(errorResponse))
-			if code == 401 {
-				errorResponse = createBadRequestResponse(err)
-			} else {
-				errorResponse = createServerErrorResponse(err)
-			}
-			_, err = con.Write(errorResponse)
-			if err != nil {
-				_, _ = fmt.Printf("can't send response, err: %s", err)
-				return err
-			}
+			// just log internally, and close the connection
+			return err
 		}
 
 		if code == 200 {
 			fmt.Println("Send close signal")
-			// fin and opcode
-			closeByte := 0b10001000
+			frame := WebsocketFrame{}
+			frame.IsFinal = true
+			frame.OpCode = OpClose
+			frame.IsMask = false
 
-			data := []byte("goodbye\n")
-
+			frame.PayLoad = []byte{}
+			data := []byte("goodbye")
 			statusCode := uint16(1000)
+			//closing need to take the first 2 byte
 			statusCodeBytes := make([]byte, 2)
 			binary.BigEndian.PutUint16(statusCodeBytes, statusCode)
+			frame.PayLoad = append(frame.PayLoad, statusCodeBytes...)
+			frame.PayLoad = append(frame.PayLoad, data...)
 
-			payload := []byte{}
-			payload = append(payload, statusCodeBytes...)
-			payload = append(payload, data...)
+			frame.Length = uint64(len(frame.PayLoad))
 
-			lengthandMask := byte(len(payload))
-
-			closeResponse := []byte{byte(closeByte), byte(lengthandMask)}
-			closeResponse = append(closeResponse, payload...)
-
-			con.Write([]byte(closeResponse))
+			err := writeWebsocketFrame(con, frame)
+			if err != nil {
+				return err
+			}
 		}
 	} else {
 		return fmt.Errorf("upgrade protocol not allowed: %s", upgrade)
@@ -244,35 +270,73 @@ func handleUpgradeConnection(request Request, con net.Conn) error {
 	return nil
 }
 
-func handleWebsocketCon(request Request, con net.Conn) (int, error) {
+func writeWebsocketFrame(con net.Conn, frame WebsocketFrame) error {
+	// fin and opcode
+	message := []byte{}
+	firstByte := byte(0b00)
+
+	if frame.IsFinal {
+		firstByte = 1 << 7
+	}
+	firstByte = firstByte | frame.OpCode
+	message = append(message, firstByte)
+
+	//message from server never mask
+
+	if frame.Length < 126 {
+		// small payload
+		message = append(message, byte(frame.Length))
+	} else if frame.Length <= 65535 {
+		// medium payload, set flag as 126
+		message = append(message, 126)
+		lenBytes := make([]byte, 2)
+		binary.BigEndian.PutUint16(lenBytes, uint16(frame.Length))
+		message = append(message, lenBytes...)
+	} else {
+		// large payload, set flag as 127
+		message = append(message, 127)
+		lenBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(lenBytes, frame.Length)
+	}
+
+	message = append(message, frame.PayLoad...)
+
+	_, err := con.Write([]byte(message))
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func handleWebsocketCon(request *Request, con net.Conn) (int, error) {
 	method := request.RequestLine.Method
 	if method != "GET" {
-		return 401, fmt.Errorf("method not allowed for websocket: %s, expedted GET", method)
+		return 405, fmt.Errorf("method not allowed for websocket: %s, expedted GET", method)
 	}
 	header := request.Header
 	host, ok := header["host"]
 	if !ok {
-		return 401, fmt.Errorf("missing header, expected host")
+		return 400, fmt.Errorf("missing header, expected host")
 	}
 	secWebSocketKey, ok := header["sec-websocket-key"]
 	if !ok {
-		return 401, fmt.Errorf("missing header, expected sec-websocket-key")
+		return 400, fmt.Errorf("missing header, expected sec-websocket-key")
 	}
 	secWebSocketVersion, ok := header["sec-websocket-version"]
 	if !ok {
-		return 401, fmt.Errorf("missing header, expected sec-websocket-version")
+		return 400, fmt.Errorf("missing header, expected sec-websocket-version")
 	}
 
-	if host != HOST {
-		return 401, fmt.Errorf("connect to wrong host")
+	if host != Host {
+		return 400, fmt.Errorf("connect to wrong host")
 	}
 
 	if !isValidBase64([]byte(secWebSocketKey)) {
-		return 401, fmt.Errorf("websocket key is not a valid base64")
+		return 400, fmt.Errorf("websocket key is not a valid base64")
 	}
 
 	if secWebSocketVersion != "13" {
-		return 401, fmt.Errorf("websocket version is not supported")
+		return 400, fmt.Errorf("websocket version is not supported")
 	}
 
 	fmt.Println("succesfully validate the request")
@@ -291,11 +355,21 @@ func handleWebsocketCon(request Request, con net.Conn) (int, error) {
 	for {
 		frame, err := parseWebsocketFrame(con)
 		if err != nil {
+			if err.Error() == "EOF" {
+				fmt.Println("Client disconnected cleanly (EOF)")
+				return 200, nil
+			}
 			return 500, err
 		}
-
-		fmt.Printf("frame is %+v", frame)
-		if frame.OpCode == 0x08 {
+		returnFrame := *frame
+		returnFrame.PayLoad = append([]byte("Simon say: "), frame.PayLoad...)
+		returnFrame.Length = uint64(len(returnFrame.PayLoad))
+		writeWebsocketFrame(con, returnFrame)
+		fmt.Printf("frame is %+v\n", frame)
+		if frame.OpCode == OpText {
+			fmt.Printf("Message is: %s", string(frame.PayLoad))
+		}
+		if frame.OpCode == OpClose {
 			fmt.Println("close connection now")
 			break
 		}
@@ -304,11 +378,23 @@ func handleWebsocketCon(request Request, con net.Conn) (int, error) {
 	return 200, nil
 }
 
-func parseWebsocketFrame(con net.Conn) (WebsocketFrame, error) {
+func parseWebsocketFrame(con net.Conn) (*WebsocketFrame, error) {
 	fmt.Println("Start parsing websocketframe")
+
+	// 1. Borrow a buffer pointer from the pool
+	bufPtr := bufferPool.Get().(*[]byte)
+
+	// 2. Ensure it goes back to the pool when this function returns
+	defer bufferPool.Put(bufPtr)
+
+	// 3. Dereference it locally so you can use it exactly like before
+	readBuffer := *bufPtr
+
+	//before:
+	// readBuffer := make([]byte, 1024)
+
 	endParsing := false
-	frame := WebsocketFrame{}
-	readBuffer := make([]byte, 1024)
+	frame := &WebsocketFrame{}
 	s := parseFin
 	var cumLength uint64 = 0
 	count := 0
@@ -319,18 +405,15 @@ func parseWebsocketFrame(con net.Conn) (WebsocketFrame, error) {
 
 ReadBufferLoop:
 	for !endParsing {
-		fmt.Println("read once?")
 		bytes, err := con.Read(readBuffer)
 		if err != nil {
-			return WebsocketFrame{}, err
+			return nil, err
 		}
 		fmt.Printf("read %d\n", bytes)
 
 		i := 0
 		for i < bytes {
 			char := readBuffer[i]
-			fmt.Printf("State: %d\n", s)
-			fmt.Printf("parsing: %b\n", char)
 			switch s {
 			case parseFin:
 				// get the first bit
@@ -344,13 +427,16 @@ ReadBufferLoop:
 				opcode := char & 0b00001111
 				frame.OpCode = opcode
 				s = parseMask
-				if opcode == 0x08 {
+				if opcode == OpClose {
 					return frame, nil
 				}
 
 			case parseMask:
 				mask := char >> 7
 				frame.IsMask = (mask == 0x01)
+				if !frame.IsMask {
+					return nil, fmt.Errorf("protocol error: client frame must be masked")
+				}
 				s = parseLength
 				continue // continue to reuse the same byte (for next parsing step)
 			case parseLength:
@@ -407,6 +493,7 @@ ReadBufferLoop:
 					continue ReadBufferLoop
 				} else {
 					cumPayload = append(cumPayload, readBuffer[i:i+rest]...)
+					unmaskPayLoad(&cumPayload, frame.MaskKey, int(frame.Length))
 					frame.PayLoad = cumPayload
 					fmt.Println("End now")
 					endParsing = true
@@ -416,6 +503,14 @@ ReadBufferLoop:
 		}
 	}
 	return frame, nil
+}
+
+func unmaskPayLoad(payload *[]byte, key [4]byte, length int) {
+	for i := range length {
+		byte := (*payload)[i]
+		maskKey := key[i%4]
+		(*payload)[i] = byte ^ maskKey
+	}
 }
 
 func isValidBase64(key []byte) bool {
@@ -432,12 +527,23 @@ func isValidBase64(key []byte) bool {
 
 }
 
-func parseHTTPWithFTM(con net.Conn) (Request, error) {
+func parseHTTPWithFSM(con net.Conn) (*Request, error) {
 	fmt.Println("parsing nowwww")
+	// 1. Borrow a buffer pointer from the pool
+	bufPtr := bufferPool.Get().(*[]byte)
+
+	// 2. Ensure it goes back to the pool when this function returns
+	defer bufferPool.Put(bufPtr)
+
+	// 3. Dereference it locally so you can use it exactly like before
+	buffer := *bufPtr
+
+	//before
+	// buffer := make([]uint8, 1024)
+
 	s := parseMethod
-	var nextState STATE
-	buffer := make([]uint8, 1024)
-	request := Request{}
+	var nextState state
+	request := &Request{}
 	fields := map[string]string{}
 	requestLine := RequestLine{}
 	key := ""
@@ -457,7 +563,7 @@ OuterLoop:
 		}
 		if err != nil {
 			_, _ = fmt.Printf("can't read file, err: %s", err)
-			return Request{}, err
+			return nil, err
 		}
 
 	StateMachineLoop:
@@ -500,7 +606,7 @@ OuterLoop:
 						break OuterLoop
 					}
 				} else {
-					return Request{}, fmt.Errorf("expected \n, found %c", char)
+					return nil, fmt.Errorf("expected \n, found %c", char)
 				}
 
 			case parseKey:
@@ -534,7 +640,7 @@ OuterLoop:
 				if char == ' ' {
 					s = nextState
 				} else {
-					return Request{}, fmt.Errorf("expected [space], found %c", char)
+					return nil, fmt.Errorf("expected [space], found %c", char)
 				}
 
 			case parseValue:
@@ -558,7 +664,7 @@ OuterLoop:
 						jsonObj := map[string]any{}
 						if err := json.Unmarshal(jsonStr, &jsonObj); err != nil {
 							_, _ = fmt.Printf("error while parsing json. Error: %s", err)
-							return Request{}, err
+							return nil, err
 						}
 						request.Body = jsonObj
 						break OuterLoop
@@ -569,24 +675,24 @@ OuterLoop:
 				bodyRead += 1
 				contentLength, err := strconv.Atoi(fields["content-length"])
 				if err != nil {
-					return Request{}, err
+					return nil, err
 				}
 
 				if bodyRead >= contentLength {
 					err := os.MkdirAll(UploadImagesFolder, os.ModePerm)
 					if err != nil {
-						return Request{}, err
+						return nil, err
 					}
 
 					fileUniqueName, err := generateHexKey(FileNameLength)
 					if err != nil {
-						return Request{}, err
+						return nil, err
 					}
 					contentType := fields["content-type"]
 					_, extension, found := strings.Cut(contentType, "/")
 
 					if !found {
-						return Request{}, fmt.Errorf("the content-type is in wrong format")
+						return nil, fmt.Errorf("the content-type is in wrong format")
 					}
 
 					filePath := UploadImagesFolder + "/" + "file" + fileUniqueName + "." + extension
@@ -595,7 +701,7 @@ OuterLoop:
 					err = os.WriteFile(filePath, []byte(imageBody), 0644)
 
 					if err != nil {
-						return Request{}, err
+						return nil, err
 					}
 					break OuterLoop
 				}
