@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -86,48 +87,69 @@ func main() {
 	}
 }
 
-func createServerErrorRepsponse(err error) []byte {
-	result := fmt.Sprintf(`HTTP/1.1 500 Internal Server Error
-Date: Fri, 10 Jul 2026 01:07:00 GMT
-Content-Type: application/json; charset=UTF-8
-Content-Length: %d
-Connection: close
-
-{
-  "error": "InternalServerError",
-  "message": "%s"
-}
-`, 53+len(err.Error()), err)
+func createWebSocketOKResponse(base64Encode string) []byte {
+	// Double quotes allow \r\n escape characters.
+	// Note the double \r\n\r\n at the very end to signal the end of HTTP headers.
+	result := fmt.Sprintf(
+		"HTTP/1.1 101 Switching Protocols\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Accept: %s\r\n"+
+			"Sec-WebSocket-Protocol: chat\r\n\r\n",
+		base64Encode,
+	)
 	return []byte(result)
 }
 
-func createBadRequestRepsponse(err error) []byte {
-	result := fmt.Sprintf(`HTTP/1.1 401 Unauthorized
-Date: Sun, 12 Jul 2026 00:09:00 GMT
-Content-Type: application/json; charset=utf-8
-Content-Length: %d
-WWW-Authenticate: Bearer realm="://example.com", error="invalid_token"
+func createServerErrorResponse(err error) []byte {
+	// It is safer to generate the JSON body first, then calculate its exact length dynamically.
+	body := fmt.Sprintf(`{"error": "InternalServerError", "message": "%s"}`, err.Error())
 
-{
-  "error": "unauthorized",
-  "message": "%s"
+	result := fmt.Sprintf(
+		"HTTP/1.1 500 Internal Server Error\r\n"+
+			"Date: Fri, 10 Jul 2026 01:07:00 GMT\r\n"+
+			"Content-Type: application/json; charset=UTF-8\r\n"+
+			"Content-Length: %d\r\n"+
+			"Connection: close\r\n\r\n"+
+			"%s",
+		len(body), body,
+	)
+	return []byte(result)
 }
-`, 46+len(err.Error()), err)
+
+func createBadRequestResponse(err error) []byte {
+	body := fmt.Sprintf(`{"error": "unauthorized", "message": "%s"}`, err.Error())
+
+	result := fmt.Sprintf(
+		"HTTP/1.1 401 Unauthorized\r\n"+
+			"Date: Sun, 12 Jul 2026 00:09:00 GMT\r\n"+
+			"Content-Type: application/json; charset=utf-8\r\n"+
+			"Content-Length: %d\r\n"+
+			"WWW-Authenticate: Bearer realm=\"://example.com\", error=\"invalid_token\"\r\n\r\n"+
+			"%s",
+		len(body), body,
+	)
 	return []byte(result)
 }
 
 func createOKResponse() []byte {
-	return []byte(`HTTP/1.1 200 OK
-Content-Type: application/json
-Content-Length: 41
+	body := `{"status": "success", "message": "hello"}`
 
-{"status": "success", "message": "hello"}`)
+	result := fmt.Sprintf(
+		"HTTP/1.1 200 OK\r\n"+
+			"Content-Type: application/json\r\n"+
+			"Content-Length: %d\r\n\r\n"+
+			"%s",
+		len(body), body,
+	)
+	return []byte(result)
 }
 
 func handleClient(con net.Conn) {
 	contents, err := parseHTTPWithFTM(con)
 	if err != nil {
-		errorResponse := createServerErrorRepsponse(err)
+
+		errorResponse := createServerErrorResponse(err)
 		_, err = con.Write(errorResponse)
 		if err != nil {
 			_, _ = fmt.Printf("can't send response, err: %s", err)
@@ -142,7 +164,13 @@ func handleClient(con net.Conn) {
 
 	if !slices.Contains(allowedMethod, method) {
 		_, _ = fmt.Printf("method %s not allowed", method)
-		return
+		err = fmt.Errorf("method %s not allowed", method)
+		errorResponse := createBadRequestResponse(err)
+		_, err = con.Write(errorResponse)
+		if err != nil {
+			_, _ = fmt.Printf("can't send response, err: %s", err)
+			return
+		}
 	}
 
 	fmt.Printf("body is: %v\n", contents.Body)
@@ -177,15 +205,38 @@ func handleUpgradeConnection(request Request, con net.Conn) error {
 			errorResponse := []byte{}
 			fmt.Println(string(errorResponse))
 			if code == 401 {
-				errorResponse = createBadRequestRepsponse(err)
+				errorResponse = createBadRequestResponse(err)
 			} else {
-				errorResponse = createServerErrorRepsponse(err)
+				errorResponse = createServerErrorResponse(err)
 			}
 			_, err = con.Write(errorResponse)
 			if err != nil {
 				_, _ = fmt.Printf("can't send response, err: %s", err)
 				return err
 			}
+		}
+
+		if code == 200 {
+			fmt.Println("Send close signal")
+			// fin and opcode
+			closeByte := 0b10001000
+
+			data := []byte("goodbye\n")
+
+			statusCode := uint16(1000)
+			statusCodeBytes := make([]byte, 2)
+			binary.BigEndian.PutUint16(statusCodeBytes, statusCode)
+
+			payload := []byte{}
+			payload = append(payload, statusCodeBytes...)
+			payload = append(payload, data...)
+
+			lengthandMask := byte(len(payload))
+
+			closeResponse := []byte{byte(closeByte), byte(lengthandMask)}
+			closeResponse = append(closeResponse, payload...)
+
+			con.Write([]byte(closeResponse))
 		}
 	} else {
 		return fmt.Errorf("upgrade protocol not allowed: %s", upgrade)
@@ -237,12 +288,18 @@ func handleWebsocketCon(request Request, con net.Conn) (int, error) {
 		return 500, err
 	}
 
-	frame, err := parseWebsocketFrame(con)
-	if err != nil {
-		return 500, err
-	}
+	for {
+		frame, err := parseWebsocketFrame(con)
+		if err != nil {
+			return 500, err
+		}
 
-	fmt.Printf("frame is %+v", frame)
+		fmt.Printf("frame is %+v", frame)
+		if frame.OpCode == 0x08 {
+			fmt.Println("close connection now")
+			break
+		}
+	}
 
 	return 200, nil
 }
@@ -262,25 +319,34 @@ func parseWebsocketFrame(con net.Conn) (WebsocketFrame, error) {
 
 ReadBufferLoop:
 	for !endParsing {
+		fmt.Println("read once?")
 		bytes, err := con.Read(readBuffer)
 		if err != nil {
 			return WebsocketFrame{}, err
 		}
+		fmt.Printf("read %d\n", bytes)
+
 		i := 0
 		for i < bytes {
 			char := readBuffer[i]
+			fmt.Printf("State: %d\n", s)
+			fmt.Printf("parsing: %b\n", char)
 			switch s {
 			case parseFin:
 				// get the first bit
 				fin := char >> 7
 				frame.IsFinal = (fin == 0x01)
 				s = parseOpCode
+				//reuse the same byte
 				continue
 			case parseOpCode:
 				// get the last 4 bits
 				opcode := char & 0b00001111
 				frame.OpCode = opcode
 				s = parseMask
+				if opcode == 0x08 {
+					return frame, nil
+				}
 
 			case parseMask:
 				mask := char >> 7
@@ -352,16 +418,6 @@ ReadBufferLoop:
 	return frame, nil
 }
 
-func createWebSocketOKResponse(base64Encode string) []byte {
-	result := fmt.Sprintf(`HTTP/1.1 101 Switching Protocols
-Upgrade: websocket
-Connection: Upgrade
-Sec-WebSocket-Accept: %s
-Sec-WebSocket-Protocol: chat
-`, base64Encode)
-	return []byte(result)
-}
-
 func isValidBase64(key []byte) bool {
 	//simple check (idc if they have special character)
 
@@ -380,7 +436,7 @@ func parseHTTPWithFTM(con net.Conn) (Request, error) {
 	fmt.Println("parsing nowwww")
 	s := parseMethod
 	var nextState STATE
-	buffer := make([]uint8, 8)
+	buffer := make([]uint8, 1024)
 	request := Request{}
 	fields := map[string]string{}
 	requestLine := RequestLine{}
