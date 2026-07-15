@@ -2,13 +2,23 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"os"
 	"slices"
@@ -16,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/hkdf"
 )
 
 type RequestLine struct {
@@ -37,6 +49,24 @@ type WebsocketFrame struct {
 	Length  uint64
 	MaskKey [4]byte
 	PayLoad []byte
+}
+
+type SecureConn struct {
+	conn             net.Conn
+	isSecure         bool
+	ServerPrivateKey *ecdh.PrivateKey
+	sharedSecretKey  []byte
+	transcript       []byte
+}
+
+// wrapper around the Net.conn behavior
+
+func (s *SecureConn) Read(b []byte) (int, error) {
+	return s.conn.Read(b)
+}
+
+func (s *SecureConn) Write(b []byte) (int, error) {
+	return s.conn.Write(b)
 }
 
 type state int
@@ -77,6 +107,47 @@ const (
 	OpPong         byte = 0x0A
 )
 
+const (
+	Handshake       byte = 0x16
+	ApplicationData byte = 0x17
+)
+
+type RecordHeader struct {
+	contentType   byte
+	legacyVersion [2]byte
+	length        int
+}
+
+const (
+	TLSClientHello         byte = 0x01
+	TLSServerHello         byte = 0x02
+	TLSEncryptedExtensions byte = 0x08
+	TLSCertificate         byte = 0xb
+	TLSCertificateVerify   byte = 0xf
+	TLSFinished            byte = 0x14
+)
+
+type HandshakeHeader struct {
+	handshakeType byte
+	length        int
+}
+
+type HelloPayload struct {
+	legacyVersion            [2]byte /* TLS v1.2 */
+	random                   [32]byte
+	legacySessionID          []byte
+	cipherSuites             []byte
+	legacyCompressionMethods []byte
+	extensions               []byte
+}
+
+type TLSMessage struct {
+	recordHeader     RecordHeader    // 5 bytes
+	handshakeHeader  HandshakeHeader // 4 bytes
+	HelloPayload     HelloPayload
+	EncryptedPayload []byte
+}
+
 // Create a global pool for 1024-byte buffers
 var bufferPool = sync.Pool{
 	New: func() any {
@@ -89,6 +160,7 @@ var bufferPool = sync.Pool{
 const UploadImagesFolder = "upload_images"
 const FileNameLength = 8
 const Host = "localhost:8080"
+const IsSecure = false
 
 func main() {
 	fmt.Println("Hello, World!")
@@ -98,18 +170,691 @@ func main() {
 		fmt.Printf("failed to bind to %s: %s", Host, err)
 		os.Exit(1)
 	}
-
 	for {
 		connection, err := server.Accept()
 		if err != nil {
-			fmt.Printf("can't open file, err: %s", err)
+			fmt.Printf("can't accept connection, err: %s", err)
 			// if err just continue
 			continue
 		}
 
-		go handleClient(connection)
+		//wrap around by a secure connection
+		secureConnection := SecureConn{
+			conn:     connection,
+			isSecure: IsSecure}
 
+		if secureConnection.isSecure {
+			//initiate the transcript
+			err := handshake(&secureConnection)
+			if err != nil {
+				fmt.Printf("failed to perform handshake, err: %s", err)
+			}
+		}
+
+		go handleClient(&secureConnection)
 	}
+}
+
+func handshake(con *SecureConn) error {
+	message, err := readClientHello(con)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("message is %#v", message)
+	serverHelloResponse := createDynamicServerHello(con, &message)
+	con.Write(*serverHelloResponse)
+	encryptedExtension, err := createEncryptedExtension(con)
+	if err != nil {
+		return err
+	}
+	con.Write(*encryptedExtension)
+
+	certificate, err := createCertificate(con)
+	if err != nil {
+		return err
+	}
+	con.Write(*certificate)
+
+	certificateVerify, err := createCertificateVerify(con)
+	if err != nil {
+		return err
+	}
+	con.Write(*certificateVerify)
+
+	return nil
+}
+
+// almost copy everything from gemini
+func encrypt(con *SecureConn, message *[]byte) (*[]byte, error) {
+	hkdfReader := hkdf.New(sha256.New, con.sharedSecretKey, nil, []byte("TLS-Session-Key-Salt"))
+	encryptionKey := make([]byte, 32) // 32 bytes = AES-256
+	if _, err := io.ReadFull(hkdfReader, encryptionKey); err != nil {
+		return nil, fmt.Errorf("HKDF failed: %v", err)
+	}
+
+	block, err := aes.NewCipher(encryptionKey)
+	if err != nil {
+		log.Fatalf("Cipher creation failed: %v", err)
+	}
+
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		log.Fatalf("GCM creation failed: %v", err)
+	}
+
+	nonce := make([]byte, aesGCM.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		log.Fatalf("Nonce generation failed: %v", err)
+	}
+
+	ciphertext := aesGCM.Seal(nonce, nonce, *message, nil)
+
+	return &ciphertext, nil
+}
+
+// copy from gemini
+func generateX25519KeyShare(con *SecureConn) ([]byte, error) {
+	// 1. Select the Curve (X25519)
+	curve := ecdh.X25519()
+
+	// 2. Generate the Private Key using crypto/rand
+	// Go automatically handles the X25519 scalar clamping/pruning under the hood
+	privateKey, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate private key: %w", err)
+	}
+
+	// Save the private key to your connection state machine
+	con.ServerPrivateKey = privateKey
+
+	// 3. Deriving the Public Key Object
+	publicKey := privateKey.PublicKey()
+
+	// 4. Exporting the Raw Bytes
+	// This returns the exact 32 bytes needed for the Key Share extension
+	rawPublicKeyBytes := publicKey.Bytes()
+
+	return rawPublicKeyBytes, nil
+}
+
+// another function being copied from gemini
+
+func ExpandLabel(secret []byte, label string, context []byte, length uint16) ([]byte, error) {
+	// 1. Construct the HkdfLabel structure
+	// struct {
+	//     uint16 length = Length;
+	//     opaque label<7..255> = "tls13 " + Label;
+	//     opaque context<0..255> = Context;
+	// } HkdfLabel;
+
+	fullLabel := "tls13 " + label
+	labelLen := len(fullLabel)
+
+	// Calculate total size: 2 bytes (length) + 1 byte (label size) + label string + 1 byte (context size) + context data
+	hkdfLabel := make([]byte, 2, 2+1+labelLen+1+len(context))
+
+	// Put 16-bit big-endian length
+	binary.BigEndian.PutUint16(hkdfLabel, length)
+
+	// Put label with length prefix
+	hkdfLabel = append(hkdfLabel, byte(labelLen))
+	hkdfLabel = append(hkdfLabel, []byte(fullLabel)...)
+
+	// Put context with length prefix
+	hkdfLabel = append(hkdfLabel, byte(len(context)))
+	hkdfLabel = append(hkdfLabel, context...)
+
+	// 2. Perform HKDF-Expand (using HMAC-SHA256 in this example)
+	// For standard HKDF, this requires iterating if length > Hash.Size()
+	h := hmac.New(sha256.New, secret)
+	h.Write(hkdfLabel)
+	h.Write([]byte{0x01}) // HKDF-Expand uses a single iteration (T(1)) for lengths <= Hash.Size()
+
+	return h.Sum(nil)[:length], nil
+}
+
+//These 3 function took straight from gemini
+
+// HKDF-Extract as defined in RFC 5869
+func hkdfExtract(salt, ikm []byte) []byte {
+	if salt == nil {
+		salt = make([]byte, sha256.Size) // defaults to all zeros
+	}
+	h := hmac.New(sha256.New, salt)
+	h.Write(ikm)
+	return h.Sum(nil)
+}
+
+// HKDF-Expand-Label structures the label as required by TLS 1.3 (RFC 8446 Sec 7.1)
+func hkdfExpandLabel(secret []byte, label string, context []byte, length int) []byte {
+	// TLS 1.3 wraps labels in a specific "tls13 " prefix
+	tls13Label := "tls13 " + label
+
+	// Create the HkdfLabel structure layout:
+	// 2 bytes: length
+	// 1 byte:  length of ("tls13 " + label)
+	// N bytes: "tls13 " + label
+	// 1 byte:  length of context
+	// M bytes: context
+	hkdfLabel := make([]byte, 2+1+len(tls13Label)+1+len(context))
+
+	binary.BigEndian.PutUint16(hkdfLabel[0:2], uint16(length))
+	hkdfLabel[2] = byte(len(tls13Label))
+	copy(hkdfLabel[3:], tls13Label)
+	hkdfLabel[3+len(tls13Label)] = byte(len(context))
+	copy(hkdfLabel[3+len(tls13Label)+1:], context)
+
+	// Perform standard HKDF-Expand (RFC 5869)
+	// For length <= 32 bytes (SHA-256), a single HMAC block iteration is enough:
+	info := hkdfLabel
+	info = append(info, 0x01) // Block constant counter
+
+	h := hmac.New(sha256.New, secret)
+	h.Write(info)
+	okm := h.Sum(nil)
+
+	return okm[:length]
+}
+
+// DeriveServerFinishedKey replicates the TLS 1.3 state machine calculations
+func DeriveServerFinishedKey(sharedSecret []byte, clientHelloServerHelloTranscriptHash []byte) []byte {
+	zeroSalt := make([]byte, sha256.Size)
+	zeroIKM := make([]byte, sha256.Size)
+	emptyHash := sha256.Sum256([]byte(""))
+
+	// 1. Calculate Early Secret from empty/zero values
+	earlySecret := hkdfExtract(zeroSalt, zeroIKM)
+
+	// 2. Derive the intermediate Handshake Secret Salt
+	derivedSecret := hkdfExpandLabel(earlySecret, "derived", emptyHash[:], sha256.Size)
+
+	// 3. Inject your raw X25519 ECDH secret to get the main Handshake Secret
+	handshakeSecret := hkdfExtract(derivedSecret, sharedSecret)
+
+	// 4. Derive the Server Handshake Traffic Secret using the Transcript Hash up to Server Hello
+	serverHandshakeTrafficSecret := hkdfExpandLabel(
+		handshakeSecret,
+		"s hs traffic",
+		clientHelloServerHelloTranscriptHash,
+		sha256.Size,
+	)
+
+	// 5. Finally, derive the Finished Key from the Traffic Secret (context is empty for this step)
+	serverFinishedKey := hkdfExpandLabel(serverHandshakeTrafficSecret, "finished", []byte(""), sha256.Size)
+
+	return serverFinishedKey
+}
+
+func createServerFinish(con *SecureConn) (*[]byte, error) {
+	recordHeaderLen := 5    // 0x17, 0x03, 0x01 + 2 bytes length
+	handshakeHeaderLen := 4 // TLSType + 3 bytes length
+
+	transcript := sha256.Sum256(con.transcript)
+	binaryData := DeriveServerFinishedKey(con.sharedSecretKey, transcript[:])
+
+	finishLength := len(binaryData)
+
+	payloadLen := finishLength // verify binary
+
+	totalLength := recordHeaderLen + handshakeHeaderLen + payloadLen
+
+	buf := make([]byte, 2)
+	// Cast int to uint16 and write to the 2-byte buffer
+	binary.BigEndian.PutUint16(buf, uint16(totalLength))
+
+	headBuf := make([]byte, 4)
+	// Cast int to uint32 and write to the 4-byte buffer
+	binary.BigEndian.PutUint32(headBuf[1:], uint32(totalLength-9))
+
+	result := make([]byte, 0, totalLength)
+
+	// record header
+	result = append(result, ApplicationData, 0x03, 0x03) // type and version 3 bytes
+	recordLenBytes := [2]byte{}
+	binary.BigEndian.PutUint16(recordLenBytes[:], uint16(handshakeHeaderLen+payloadLen))
+	result = append(result, recordLenBytes[:]...) // length 2 bytes
+
+	// handshake header
+	unencryptedData := make([]byte, 0, handshakeHeaderLen)
+	unencryptedData = append(unencryptedData, TLSCertificateVerify) // 1 byte
+	handshakeLenBytes := [4]byte{}
+	binary.BigEndian.PutUint32(handshakeLenBytes[:], uint32(payloadLen))
+	unencryptedData = append(unencryptedData, handshakeLenBytes[1:]...) // lenght 3 bytes
+
+	// handshake payload
+	unencryptedData = append(unencryptedData, binaryData...) // verify data
+
+	encryptedData, err := encrypt(con, &unencryptedData)
+	if err != nil {
+		return nil, err
+	}
+
+	result = append(result, *encryptedData...) // should i copy mem instead?
+
+	return &result, nil
+}
+
+func createCertificateVerify(con *SecureConn) (*[]byte, error) {
+	// read the mkcert generated credential
+	b64String, err := LoadAndSignTranscript("./localhost-key.pem", sha256.Sum256(con.transcript))
+	if err != nil {
+		return nil, err
+	}
+	binaryData, err := base64.StdEncoding.DecodeString(string(b64String))
+	if err != nil {
+		log.Fatalf("Decoding failed: %v", err)
+	}
+	signLength := len(binaryData)
+	recordHeaderLen := 5    // 0x17, 0x03, 0x01 + 2 bytes length
+	handshakeHeaderLen := 4 // TLSType + 3 bytes length
+
+	payloadLen := 2 + // signature algorithm
+		2 + // signature length
+		signLength // actual signature binary
+
+	totalLength := recordHeaderLen + handshakeHeaderLen + payloadLen
+
+	buf := make([]byte, 2)
+	// Cast int to uint16 and write to the 2-byte buffer
+	binary.BigEndian.PutUint16(buf, uint16(totalLength))
+
+	headBuf := make([]byte, 4)
+	// Cast int to uint32 and write to the 4-byte buffer
+	binary.BigEndian.PutUint32(headBuf[1:], uint32(totalLength-9))
+
+	signBuf := make([]byte, 2)
+	// Cast int to uint32 and write to the 2-byte buffer
+	binary.BigEndian.PutUint16(signBuf[1:], uint16(signLength))
+
+	result := make([]byte, 0, totalLength)
+
+	// record header
+	result = append(result, ApplicationData, 0x03, 0x03) // type and version 3 bytes
+	recordLenBytes := [2]byte{}
+	binary.BigEndian.PutUint16(recordLenBytes[:], uint16(handshakeHeaderLen+payloadLen))
+	result = append(result, recordLenBytes[:]...) // length 2 bytes
+
+	// handshake header
+	unencryptedData := make([]byte, 0, handshakeHeaderLen)
+	unencryptedData = append(unencryptedData, TLSCertificateVerify) // 1 byte
+	handshakeLenBytes := [4]byte{}
+	binary.BigEndian.PutUint32(handshakeLenBytes[:], uint32(payloadLen))
+	unencryptedData = append(unencryptedData, handshakeLenBytes[1:]...) // lenght 3 bytes
+
+	// handshake payload
+	unencryptedData = append(unencryptedData, 0x04, 0x03)    //signature algorithm ecdsa_secp256r1_sha256
+	unencryptedData = append(unencryptedData, signBuf...)    // signature length
+	unencryptedData = append(unencryptedData, binaryData...) // actual binary of signature
+
+	con.transcript = append(con.transcript, unencryptedData...)
+
+	encryptedData, err := encrypt(con, &unencryptedData)
+	if err != nil {
+		return nil, err
+	}
+
+	result = append(result, *encryptedData...) // should i copy mem instead?
+
+	return &result, nil
+}
+
+//copy completely from gemini, i don't want to deal with this sh
+
+func LoadAndSignTranscript(pemFilePath string, transcriptHash [32]byte) ([]byte, error) {
+	// 1. Load the localhost-key.pem file
+	pemBytes, err := os.ReadFile(pemFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read key file: %w", err)
+	}
+
+	// 2. Decode the PEM block
+	block, _ := pem.Decode(pemBytes)
+	if block == nil || (block.Type != "EC PRIVATE KEY" && block.Type != "PRIVATE KEY") {
+		return nil, fmt.Errorf("failed to decode valid PEM block from private key")
+	}
+
+	// 3. Parse into an ECDSA Private Key object
+	var privKey *ecdsa.PrivateKey
+	if block.Type == "EC PRIVATE KEY" {
+		privKey, err = x509.ParseECPrivateKey(block.Bytes)
+	} else {
+		// Fallback for PKCS#8 unencrypted private keys
+		var parsedKey any
+		parsedKey, err = x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err == nil {
+			var ok bool
+			privKey, ok = parsedKey.(*ecdsa.PrivateKey)
+			if !ok {
+				return nil, fmt.Errorf("parsed PKCS#8 key is not an ECDSA private key")
+			}
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse ECDSA private key: %w", err)
+	}
+
+	// 4. Build the 64-space padding + context string + transcript hash buffer
+	// TLS 1.3 CertificateVerify server context string: "TLS 1.3, server CertificateVerify"
+	contextStr := "TLS 1.3, server CertificateVerify"
+
+	// Total size: 64 (spaces) + len(contextStr) + 1 (null terminator) + 32 (transcript hash)
+	totalBufferLen := 64 + len(contextStr) + 1 + len(transcriptHash)
+	signBuffer := make([]byte, 0, totalBufferLen)
+
+	// Append 64 space bytes (0x20)
+	for i := 0; i < 64; i++ {
+		signBuffer = append(signBuffer, 0x20)
+	}
+	// Append context string and the required 0x00 null byte delimiter
+	signBuffer = append(signBuffer, contextStr...)
+	signBuffer = append(signBuffer, 0x00)
+	// Append the 32-byte Handshake Transcript Hash
+	signBuffer = append(signBuffer, transcriptHash[:]...)
+
+	// 5. Hash the combined buffer with SHA-256
+	hashedBuffer := sha256.Sum256(signBuffer)
+
+	// 6. Pass hash to Go's ECDSA signing function
+	// SignASN1 returns the ASN.1 DER-encoded signature (r, s) required by TLS 1.3
+	signature, err := ecdsa.SignASN1(rand.Reader, privKey, hashedBuffer[:]) // [1]
+	if err != nil {
+		return nil, fmt.Errorf("ecdsa signing failed: %w", err)
+	}
+
+	// Returns the raw byte slice payload ready for your CertificateVerify struct
+	return signature, nil
+}
+
+func createCertificate(con *SecureConn) (*[]byte, error) {
+	// read the mkcert generated credential
+	b64String, err := os.ReadFile("./localhost.pem")
+	if err != nil {
+		return nil, err
+	}
+	binaryData, err := base64.StdEncoding.DecodeString(string(b64String))
+	if err != nil {
+		log.Fatalf("Decoding failed: %v", err)
+	}
+	certLength := len(binaryData)
+
+	recordHeaderLen := 5    // 0x16, 0x03, 0x01 + 2 bytes length
+	handshakeHeaderLen := 4 // TLSCertificate + 3 bytes length
+
+	payloadLen := 1 + // context len
+		3 + // certs total length
+		3 + // cert length
+		certLength + // actual certificate
+		2 // extension length
+
+	totalLength := recordHeaderLen + handshakeHeaderLen + payloadLen
+
+	buf := make([]byte, 2)
+	// Cast int to uint16 and write to the 2-byte buffer
+	binary.BigEndian.PutUint16(buf, uint16(totalLength))
+
+	headBuf := make([]byte, 4)
+	// Cast int to uint32 and write to the 4-byte buffer
+	binary.BigEndian.PutUint32(headBuf[1:], uint32(totalLength-9))
+
+	certBuf := make([]byte, 4)
+	// Cast int to uint32 and write to the 4-byte buffer
+	binary.BigEndian.PutUint32(certBuf[1:], uint32(totalLength-13))
+
+	result := make([]byte, 0, totalLength)
+
+	// record header
+	result = append(result, ApplicationData, 0x03, 0x03) // type and version 3 bytes
+	recordLenBytes := [2]byte{}
+	binary.BigEndian.PutUint16(recordLenBytes[:], uint16(handshakeHeaderLen+payloadLen))
+	result = append(result, recordLenBytes[:]...) // length 2 bytes
+
+	// handshake header
+	unencryptedData := make([]byte, 0, handshakeHeaderLen)
+	unencryptedData = append(unencryptedData, TLSCertificate) // 1 byte
+	handshakeLenBytes := [4]byte{}
+	binary.BigEndian.PutUint32(handshakeLenBytes[:], uint32(payloadLen))
+	unencryptedData = append(unencryptedData, handshakeLenBytes[1:]...) // lenght 3 bytes
+
+	// handshake payload
+	unencryptedData = append(unencryptedData, 0x00)          // certificate request context len
+	unencryptedData = append(unencryptedData, certBuf...)    // certificate total length
+	unencryptedData = append(unencryptedData, binaryData...) // actual binary of certificate
+	unencryptedData = append(unencryptedData, 0x00, 0x00)    // extension length
+
+	// save the unencrypted to the transcript
+	con.transcript = append(con.transcript, unencryptedData...)
+
+	encryptedData, err := encrypt(con, &unencryptedData)
+	if err != nil {
+		return nil, err
+	}
+
+	result = append(result, *encryptedData...) // should i copy mem instead?
+
+	return &result, nil
+}
+func createEncryptedExtension(con *SecureConn) (*[]byte, error) {
+	recordHeaderLen := 5    // 0x17, 0x03, 0x01 + 2 bytes length
+	handshakeHeaderLen := 4 // TLSEncryptedExtensions + 3 bytes length
+
+	payloadLen := 0
+
+	totalLength := recordHeaderLen + handshakeHeaderLen + payloadLen
+
+	buf := make([]byte, 2)
+	// Cast int to uint16 and write to the 2-byte buffer
+	binary.BigEndian.PutUint16(buf, uint16(totalLength))
+
+	headBuf := make([]byte, 4)
+	// Cast int to uint32 and write to the 4-byte buffer
+	binary.BigEndian.PutUint32(headBuf[1:], uint32(totalLength-9))
+
+	result := make([]byte, 0, totalLength)
+
+	// record header
+	result = append(result, ApplicationData, 0x03, 0x03) // type and version 3 bytes
+	recordLenBytes := [2]byte{}
+	binary.BigEndian.PutUint16(recordLenBytes[:], uint16(handshakeHeaderLen+payloadLen))
+	result = append(result, recordLenBytes[:]...) // length 2 bytes
+
+	// handshake header
+	unencryptedData := make([]byte, 0, handshakeHeaderLen)
+	unencryptedData = append(unencryptedData, TLSEncryptedExtensions) // 1 byte
+	handshakeLenBytes := [4]byte{}
+	binary.BigEndian.PutUint32(handshakeLenBytes[:], uint32(payloadLen))
+	unencryptedData = append(unencryptedData, handshakeLenBytes[1:]...) // lenght 3 bytes
+
+	encryptedData, err := encrypt(con, &unencryptedData)
+	if err != nil {
+		return nil, err
+	}
+
+	result = append(result, *encryptedData...) // should i copy mem instead?
+
+	return &result, nil
+}
+
+func createDynamicServerHello(con *SecureConn, message *TLSMessage) *[]byte {
+	echoSessionID := message.HelloPayload.legacySessionID
+	echoLength := byte(len(echoSessionID))
+	random := make([]byte, 32)
+	rand.Read(random)
+
+	publicKey, _ := generateX25519KeyShare(con)
+
+	recordHeaderLen := 5    // 0x16, 0x03, 0x01 + 2 bytes length
+	handshakeHeaderLen := 4 // TLSServerHello + 3 bytes length
+
+	payloadLen := 2 + // version (0x03, 0x03)
+		32 + // random
+		1 + int(echoLength) + // session ID len + session ID
+		2 + // cipher suite
+		1 + // compression
+		2 + // extension length
+		6 + // supported versions extension
+		40 // key share extension (8 bytes header + 32 bytes public key)
+
+	totalLength := recordHeaderLen + handshakeHeaderLen + payloadLen
+
+	buf := make([]byte, 2)
+	// Cast int to uint16 and write to the 2-byte buffer
+	binary.BigEndian.PutUint16(buf, uint16(totalLength))
+
+	headBuf := make([]byte, 4)
+	// Cast int to uint32 and write to the 4-byte buffer
+	binary.BigEndian.PutUint32(headBuf[1:], uint32(totalLength-9))
+
+	result := make([]byte, 0, totalLength)
+	// record header
+	result = append(result, Handshake, 0x03, 0x03) // type and version 3 bytes
+	recordLenBytes := [2]byte{}
+	binary.BigEndian.PutUint16(recordLenBytes[:], uint16(handshakeHeaderLen+payloadLen))
+	result = append(result, recordLenBytes[:]...) // length 2 bytes
+
+	// handshake header
+	result = append(result, TLSServerHello) // 1 byte
+	handshakeLenBytes := [4]byte{}
+	binary.BigEndian.PutUint32(handshakeLenBytes[:], uint32(payloadLen))
+	result = append(result, handshakeLenBytes[1:]...) // lenght 3 bytes
+
+	// handshake payload
+	result = append(result, 0x03, 0x03)       // version 2 bytes
+	result = append(result, random...)        // 32 bytes
+	result = append(result, echoLength)       // 1 byte
+	result = append(result, echoSessionID...) // echoLength bytes
+	result = append(result, 0x13, 0x01)       // cipher suite 2 bytes
+	result = append(result, 0x00)             // compression 1 byte
+	result = append(result, 0x00, 0x2E)       // extension length 2 byte
+	// supported version
+	result = append(result, 0x00, 0x2B, 0x00, 0x02, 0x03, 0x04) // 6 bytes
+	//key share 40 bytes
+	result = append(result, 0x00, 0x33, 0x00, 0x24, 0x00, 0x1D, 0x00, 0x20) //  8 bytes
+	result = append(result, publicKey...)                                   // 32 bytes
+
+	// save to the transcript
+	con.transcript = append(con.transcript, result...)
+
+	return &result
+}
+
+func readClientHello(con *SecureConn) (TLSMessage, error) {
+	message := TLSMessage{}
+	recordHeader := RecordHeader{}
+	handshakeHeader := HandshakeHeader{}
+	payload := HelloPayload{}
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr)
+	readBuffer := *bufPtr
+
+	header, err := readNBytes(con.conn, &readBuffer, 5)
+	if err != nil {
+		return TLSMessage{}, fmt.Errorf("error while reading handshake buffer, err: %s", err)
+	}
+	recordType := byte(header[0])
+	recordHeader.contentType = recordType
+	recordHeader.legacyVersion = [2]byte(header[1:3])
+
+	//turn into useable int
+	recordLength := header[3:]
+	var recordPad [4]byte
+	copy(recordPad[2:], recordLength)
+	recordLengthInt := int(binary.BigEndian.Uint32(recordPad[:]))
+	recordHeader.length = recordLengthInt
+
+	message.recordHeader = recordHeader
+
+	handshake, err := readNBytes(con.conn, &readBuffer, recordLengthInt)
+	if err != nil {
+		return TLSMessage{}, fmt.Errorf("error while reading handshake buffer, err: %s", err)
+	}
+	// save to the transcript
+	con.transcript = append(con.transcript, handshake...)
+
+	handshakeType := byte(handshake[0])
+	handshakeHeader.handshakeType = handshakeType
+
+	// turn into usable int
+	handshakeLength := handshake[1:4]
+	var pad [4]byte
+	copy(pad[1:], handshakeLength)
+	payloadLength := int(binary.BigEndian.Uint32(pad[:]))
+	handshakeHeader.length = payloadLength
+
+	message.handshakeHeader = handshakeHeader
+
+	if recordLengthInt < payloadLength {
+		return TLSMessage{}, fmt.Errorf("the payload is bigger than record, means the message splits out to 2 or more record, which is not allowed here")
+	}
+
+	payload.legacyVersion = [2]byte(handshake[4:6])
+	payload.random = [32]byte(handshake[6 : 6+32])
+
+	cursor := 6 + 32
+	IDLength := int(handshake[cursor])
+	cursor += 1
+	LegacyID := handshake[cursor : cursor+IDLength]
+	cursor += IDLength
+	payload.legacySessionID = LegacyID
+
+	cipherLength := int(binary.BigEndian.Uint16(handshake[cursor : cursor+2]))
+	cursor += 2
+
+	payload.cipherSuites = handshake[cursor : cursor+cipherLength]
+	cursor += cipherLength
+
+	payload.legacyCompressionMethods = handshake[cursor : cursor+2]
+	cursor += 2
+
+	extensionLength := int(binary.BigEndian.Uint16(handshake[cursor : cursor+2]))
+	cursor += 2
+
+	extensions := handshake[cursor : cursor+extensionLength]
+	payload.extensions = extensions
+
+	// loop to find the ephemeral key
+	i := 0
+	for {
+		exType := extensions[i : i+2]
+		i += 2
+		// key_share type
+		if bytes.Equal(exType, []byte{0x00, 0x33}) {
+			i += 2 //skip the length because we know it's 32 bytes
+			pubKey, err := ecdh.X25519().NewPublicKey(extensions[i : i+32])
+			if err != nil {
+				return TLSMessage{}, fmt.Errorf("failed to parse public key: %v", err)
+			}
+			rawSecret, err := con.ServerPrivateKey.ECDH(pubKey)
+			if err != nil {
+				return TLSMessage{}, fmt.Errorf("ECDH failed: %v", err)
+			}
+			con.sharedSecretKey = rawSecret
+			break
+		} else {
+			skipLength := int(binary.BigEndian.Uint16(extensions[i : i+2]))
+			i += 2          // skip the length
+			i += skipLength //skip the data
+		}
+	}
+
+	cursor += extensionLength
+	if cursor != len(handshake) {
+		return TLSMessage{}, fmt.Errorf("something went wrong, the number of byte parsed is incorrect")
+	}
+
+	message.HelloPayload = payload
+
+	return message, nil
+}
+
+func readNBytes(con net.Conn, buffer *[]byte, n int) ([]byte, error) {
+	// borrow the buffer but only use n amount of bytes
+	readBuffer := (*buffer)[:n]
+	bytes, err := io.ReadFull(con, readBuffer)
+	if err != nil {
+		return nil, err
+	}
+	result := readBuffer[:bytes]
+	return result, nil
 }
 
 func createWebSocketOKResponse(base64Encode string) []byte {
@@ -179,7 +924,7 @@ func createOKResponse() []byte {
 	return []byte(result)
 }
 
-func handleClient(con net.Conn) {
+func handleClient(con *SecureConn) {
 	contents, err := parseHTTPWithFSM(con)
 	if err != nil {
 		errorResponse := createServerErrorResponse(err)
@@ -227,7 +972,7 @@ func handleClient(con net.Conn) {
 	}
 }
 
-func handleUpgradeConnection(request *Request, con net.Conn) error {
+func handleUpgradeConnection(request *Request, con *SecureConn) error {
 	upgrade, ok := request.Header["upgrade"]
 	if !ok {
 		return fmt.Errorf("need to specify the upgrade protocol name")
@@ -270,7 +1015,7 @@ func handleUpgradeConnection(request *Request, con net.Conn) error {
 	return nil
 }
 
-func writeWebsocketFrame(con net.Conn, frame WebsocketFrame) error {
+func writeWebsocketFrame(con *SecureConn, frame WebsocketFrame) error {
 	// fin and opcode
 	message := []byte{}
 	firstByte := byte(0b00)
@@ -308,7 +1053,7 @@ func writeWebsocketFrame(con net.Conn, frame WebsocketFrame) error {
 	return nil
 }
 
-func handleWebsocketCon(request *Request, con net.Conn) (int, error) {
+func handleWebsocketCon(request *Request, con *SecureConn) (int, error) {
 	method := request.RequestLine.Method
 	if method != "GET" {
 		return 405, fmt.Errorf("method not allowed for websocket: %s, expedted GET", method)
@@ -378,7 +1123,7 @@ func handleWebsocketCon(request *Request, con net.Conn) (int, error) {
 	return 200, nil
 }
 
-func parseWebsocketFrame(con net.Conn) (*WebsocketFrame, error) {
+func parseWebsocketFrame(con *SecureConn) (*WebsocketFrame, error) {
 	fmt.Println("Start parsing websocketframe")
 
 	// 1. Borrow a buffer pointer from the pool
@@ -527,7 +1272,7 @@ func isValidBase64(key []byte) bool {
 
 }
 
-func parseHTTPWithFSM(con net.Conn) (*Request, error) {
+func parseHTTPWithFSM(con *SecureConn) (*Request, error) {
 	fmt.Println("parsing nowwww")
 	// 1. Borrow a buffer pointer from the pool
 	bufPtr := bufferPool.Get().(*[]byte)

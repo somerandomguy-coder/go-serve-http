@@ -1,0 +1,12 @@
+FIELD NAME                      SIZE (BYTES)    TYPICAL VALUE / DESCRIPTION
+----------------------------------------------------------------------------------
+[ DECRYPTED HANDSHAKE HEADER ]
+Handshake Type                  1 byte          0x08 (EncryptedExtensions)
+Handshake Length                3 bytes         0x00 0x00 0x0E (Length of the payload)
+
+[ ENCRYPTED EXTENSIONS PAYLOAD ]
+Extensions Total Length         2 bytes         0x00 0x0A (10 bytes of extensions)
+  ├─ Extension Type             2 bytes         0x00 0x10 (ALPN - Application-Layer Protocol Negotiation)
+  ├─ Extension Length           2 bytes         0x00 0x05 (5 bytes)
+  └─ Extension Data             5 bytes         0x04 0x68 0x32 0x31 0x33 (e.g., selecting "h2")
+

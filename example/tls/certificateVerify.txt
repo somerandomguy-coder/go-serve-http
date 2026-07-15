@@ -1,0 +1,12 @@
+FIELD NAME                      SIZE (BYTES)    TYPICAL VALUE / DESCRIPTION
+----------------------------------------------------------------------------------
+[ DECRYPTED HANDSHAKE HEADER ]
+Handshake Type                  1 byte          0x0F (CertificateVerify)
+Handshake Length                3 bytes         0x00 0x01 0x04 (Length of the payload)
+
+[ CERTIFICATE VERIFY PAYLOAD ]
+Signature Algorithm             2 bytes         0x08 0x04 (rsa_pss_rsae_sha256) or 
+                                                0x04 0x03 (ecdsa_secp256r1_sha256)
+Signature Length                2 bytes         0x01 0x00 (e.g., 256 bytes for a 2048-bit RSA key)
+Signature Data                  Variable        [The raw cryptographic signature bytes]
+

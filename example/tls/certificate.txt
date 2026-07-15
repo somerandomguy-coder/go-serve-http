@@ -1,0 +1,18 @@
+FIELD NAME                      SIZE (BYTES)    TYPICAL VALUE / DESCRIPTION
+----------------------------------------------------------------------------------
+[ DECRYPTED HANDSHAKE HEADER ]
+Handshake Type                  1 byte          0x0B (Certificate)
+Handshake Length                3 bytes         0x00 0x0A 0x42 (Length of the entire payload)
+
+[ CERTIFICATE PAYLOAD ]
+Certificate Request Context Len 1 byte          0x00 (Always 0x00 for server certificates)
+Certificate List Total Length   3 bytes         0x00 0x0A 0x3E (Total bytes for all certs + extensions)
+
+  ├── Certificate 1 Length      3 bytes         0x00 0x05 0x10 (Length of the leaf cert data)
+  ├── Certificate 1 Data        Variable        [Raw DER-encoded binary X.509 Certificate]
+  ├── Cert 1 Extensions Length  2 bytes         0x00 0x00 (Usually 0x00 for standard handshakes)
+  │
+  ├── Certificate 2 Length      3 bytes         0x00 0x05 0x20 (Length of intermediate CA cert)
+  ├── Certificate 2 Data        Variable        [Raw DER-encoded binary Intermediate Cert]
+  └── Cert 2 Extensions Length  2 bytes         0x00 0x00
+

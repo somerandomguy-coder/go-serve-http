@@ -1,0 +1,12 @@
+FIELD NAME                      SIZE (BYTES)    TYPICAL VALUE / DESCRIPTION
+----------------------------------------------------------------------------------
+[ DECRYPTED HANDSHAKE HEADER ]
+Handshake Type                  1 byte          0x14 (Finished)
+Handshake Length                3 bytes         0x00 0x00 0x20 (32 bytes for SHA-256) or
+                                                0x00 0x00 0x30 (48 bytes for SHA-384)
+
+[ FINISHED PAYLOAD ]
+Verify Data                     Variable        [32 or 48 bytes of HMAC data]
+                                                (Calculated using the HKDF finished_key 
+                                                over the accumulated handshake hash)
+
