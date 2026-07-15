@@ -188,6 +188,7 @@ func main() {
 			err := handshake(&secureConnection)
 			if err != nil {
 				fmt.Printf("failed to perform handshake, err: %s", err)
+				continue
 			}
 		}
 
@@ -201,7 +202,8 @@ func handshake(con *SecureConn) error {
 		return err
 	}
 	fmt.Printf("message is %#v", message)
-	serverHelloResponse := createDynamicServerHello(con, &message)
+	publicKey, _ := generateX25519KeyShare(con)
+	serverHelloResponse := createDynamicServerHello(con, &message, publicKey)
 	con.Write(*serverHelloResponse)
 	encryptedExtension, err := createEncryptedExtension(con)
 	if err != nil {
@@ -220,6 +222,12 @@ func handshake(con *SecureConn) error {
 		return err
 	}
 	con.Write(*certificateVerify)
+
+	serverFinish, err := createServerFinish(con)
+	if err != nil {
+		return err
+	}
+	con.Write(*serverFinish)
 
 	return nil
 }
@@ -674,13 +682,11 @@ func createEncryptedExtension(con *SecureConn) (*[]byte, error) {
 	return &result, nil
 }
 
-func createDynamicServerHello(con *SecureConn, message *TLSMessage) *[]byte {
+func createDynamicServerHello(con *SecureConn, message *TLSMessage, publicKey []byte) *[]byte {
 	echoSessionID := message.HelloPayload.legacySessionID
 	echoLength := byte(len(echoSessionID))
 	random := make([]byte, 32)
 	rand.Read(random)
-
-	publicKey, _ := generateX25519KeyShare(con)
 
 	recordHeaderLen := 5    // 0x16, 0x03, 0x01 + 2 bytes length
 	handshakeHeaderLen := 4 // TLSServerHello + 3 bytes length
@@ -732,7 +738,7 @@ func createDynamicServerHello(con *SecureConn, message *TLSMessage) *[]byte {
 	result = append(result, publicKey...)                                   // 32 bytes
 
 	// save to the transcript
-	con.transcript = append(con.transcript, result...)
+	con.transcript = append(con.transcript, result[5:]...)
 
 	return &result
 }
@@ -818,7 +824,11 @@ func readClientHello(con *SecureConn) (TLSMessage, error) {
 		i += 2
 		// key_share type
 		if bytes.Equal(exType, []byte{0x00, 0x33}) {
-			i += 2 //skip the length because we know it's 32 bytes
+			i += 2 // Skip outer extension length
+			i += 2 // Skip inner Client Shares List Length
+			i += 2 // Skip Named Group ID (assuming it's X25519)
+			i += 2 // Skip Key Length (0x0020)
+
 			pubKey, err := ecdh.X25519().NewPublicKey(extensions[i : i+32])
 			if err != nil {
 				return TLSMessage{}, fmt.Errorf("failed to parse public key: %v", err)
@@ -933,6 +943,7 @@ func handleClient(con *SecureConn) {
 			_, _ = fmt.Printf("can't send response, err: %s", err)
 			return
 		}
+		return
 	}
 
 	fmt.Printf("Request: %#v\n", contents)
