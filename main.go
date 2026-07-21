@@ -29,6 +29,13 @@ import (
 	"time"
 )
 
+// configuration
+
+const UploadImagesFolder = "upload_images"
+const FileNameLength = 8
+const Host = "localhost:8080"
+const IsSecure = true
+
 type RequestLine struct {
 	Method        string
 	RequestTarget string
@@ -108,21 +115,12 @@ func (s *SecureConn) Read(b []byte) (int, error) {
 
 		byteRead, err = s.conn.Read(payloadBuf)
 		if err != nil {
-			// if err.Error() == "EOF" {
-			// 	fmt.Println("Client disconnected cleanly (EOF)")
-			// 	return byteRead, nil
-			// }
 			fmt.Printf("error while reading from connection %s", err)
 			return 0, err
 		}
 		ciphertext := payloadBuf[:byteRead]
 
-		fmt.Printf("read this much bytes from pipe: %d\n", byteRead)
-		fmt.Printf("INFO: header is: %v\n", header)
-
-		fmt.Printf("INFO: ciphertext is: %v\n", ciphertext)
 		result, err := DecryptRecord(ciphertext, header, s.clientKey, s.clientIV, s.incomingSeq)
-		fmt.Printf("decrypted msg: %v\n", result)
 		if err != nil {
 			return 0, err
 		}
@@ -133,7 +131,6 @@ func (s *SecureConn) Read(b []byte) (int, error) {
 
 		cleanPayload := result[:len(result)-1]
 
-		fmt.Printf("decrypted msg: %q\n", cleanPayload)
 		if len(cleanPayload) > len(b) {
 			_ = fmt.Errorf("buffer too smol, need bigger buffer")
 		}
@@ -169,8 +166,6 @@ func secure(con *SecureConn, message *[]byte) (*[]byte, error) {
 	// 2. Pre-calculate the GCM Ciphertext Length (Plaintext + 16-byte GCM tag)
 	ciphertextLen := len(result) + 16
 
-	fmt.Printf("unencryptedData is: %v\n", result)
-
 	aad := make([]byte, 5)
 	aad[0] = ApplicationData // 0x17
 	aad[1] = 0x03            // Legacy Version High
@@ -198,9 +193,6 @@ func secure(con *SecureConn, message *[]byte) (*[]byte, error) {
 
 	// payload
 	result = append(result, encryptedMessage...)
-
-	fmt.Printf("final data is: %v\n", result)
-	fmt.Printf("final data len is: %d\n", len(result))
 
 	return &result, nil
 }
@@ -293,14 +285,12 @@ var bufferPool = sync.Pool{
 	},
 }
 
-const UploadImagesFolder = "upload_images"
-const FileNameLength = 8
-const Host = "localhost:8080"
-const IsSecure = true
-
 func main() {
-	fmt.Println("Hello, World!")
-	fmt.Printf("Server listen on: %s\n", Host)
+	if IsSecure {
+		fmt.Printf("Server listen on secure mode on: https://%s\n", Host)
+	} else {
+		fmt.Printf("Server listen on unsecure mode on: http://%s\n", Host)
+	}
 	server, err := net.Listen("tcp", Host)
 	if err != nil {
 		fmt.Printf("failed to bind to %s: %s", Host, err)
@@ -326,7 +316,7 @@ func main() {
 				fmt.Printf("failed to perform handshake, err: %s", err)
 				continue
 			}
-			fmt.Println("succesfully establish secure connection!!!")
+			fmt.Println("Succesfully establish secure connection!!!")
 		}
 
 		go handleClient(&secureConnection)
@@ -1301,6 +1291,7 @@ func createOKResponse() []byte {
 }
 
 func handleClient(con *SecureConn) {
+	fmt.Printf("Accept connection from %s\n", con.conn.RemoteAddr())
 	defer con.conn.Close()
 
 	contents, err := parseHTTPWithFSM(con)
@@ -1314,7 +1305,8 @@ func handleClient(con *SecureConn) {
 		return
 	}
 
-	fmt.Printf("Request: %#v\n", contents)
+	fmt.Printf("	Request: %#v\n\n", contents)
+	fmt.Printf("	Request Method: %#v\n", contents.RequestLine.Method)
 
 	allowedMethod := []string{"GET", "POST", "QUERY"}
 	method := contents.RequestLine.Method
@@ -1330,7 +1322,9 @@ func handleClient(con *SecureConn) {
 		}
 	}
 
-	fmt.Printf("body is: %v\n", contents.Body)
+	if len(contents.Body) != 0 {
+		fmt.Printf("body is: %v\n", contents.Body)
+	}
 
 	connection, ok := contents.Header["connection"]
 	if ok {
@@ -1350,7 +1344,8 @@ func handleClient(con *SecureConn) {
 		return
 	}
 
-	fmt.Printf("finish send the response")
+	fmt.Printf("Finish send the response to %s\n", con.conn.RemoteAddr())
+	fmt.Println("-----------------------------")
 }
 
 func handleUpgradeConnection(request *Request, con *SecureConn) error {
@@ -1389,6 +1384,8 @@ func handleUpgradeConnection(request *Request, con *SecureConn) error {
 			if err != nil {
 				return err
 			}
+
+			con.conn.Close()
 		}
 	} else {
 		return fmt.Errorf("upgrade protocol not allowed: %s", upgrade)
@@ -1465,7 +1462,7 @@ func handleWebsocketCon(request *Request, con *SecureConn) (int, error) {
 		return 400, fmt.Errorf("websocket version is not supported")
 	}
 
-	fmt.Println("succesfully validate the request")
+	fmt.Println("		Succesfully validate the websocket request")
 
 	magicString := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	concatenateString := secWebSocketKey + magicString
@@ -1491,7 +1488,6 @@ func handleWebsocketCon(request *Request, con *SecureConn) (int, error) {
 		returnFrame.PayLoad = append([]byte("Simon say: "), frame.PayLoad...)
 		returnFrame.Length = uint64(len(returnFrame.PayLoad))
 		writeWebsocketFrame(con, returnFrame)
-		fmt.Printf("frame is %+v\n", frame)
 		if frame.OpCode == OpText {
 			fmt.Printf("Message is: %s", string(frame.PayLoad))
 		}
@@ -1505,7 +1501,7 @@ func handleWebsocketCon(request *Request, con *SecureConn) (int, error) {
 }
 
 func parseWebsocketFrame(con *SecureConn) (*WebsocketFrame, error) {
-	fmt.Println("Start parsing websocketframe")
+	fmt.Println("		Start parsing websocketframe")
 
 	// 1. Borrow a buffer pointer from the pool
 	bufPtr := bufferPool.Get().(*[]byte)
@@ -1535,7 +1531,6 @@ ReadBufferLoop:
 		if err != nil {
 			return nil, err
 		}
-		fmt.Printf("read %d\n", bytes)
 
 		i := 0
 		for i < bytes {
@@ -1621,7 +1616,6 @@ ReadBufferLoop:
 					cumPayload = append(cumPayload, readBuffer[i:i+rest]...)
 					unmaskPayLoad(&cumPayload, frame.MaskKey, int(frame.Length))
 					frame.PayLoad = cumPayload
-					fmt.Println("End now")
 					endParsing = true
 				}
 			}
@@ -1654,7 +1648,7 @@ func isValidBase64(key []byte) bool {
 }
 
 func parseHTTPWithFSM(con *SecureConn) (*Request, error) {
-	fmt.Println("parsing nowwww")
+	fmt.Println("	Parsing HTTP Request nowwww")
 	// 1. Borrow a buffer pointer from the pool
 	bufPtr := bufferPool.Get().(*[]byte)
 
@@ -1684,7 +1678,6 @@ func parseHTTPWithFSM(con *SecureConn) (*Request, error) {
 OuterLoop:
 	for {
 		bytes, err := con.Read(buffer)
-		fmt.Println(bytes)
 		if bytes <= 0 {
 			fmt.Println("error while reading bytes or finish reading")
 			break
