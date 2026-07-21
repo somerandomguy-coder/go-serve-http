@@ -1,7 +1,9 @@
 # HTTP Server in GO
 
 HTTP Server to parse HTTP request and process it 
+
 Websocket sit on top of HTTP server to echo back frame
+
 Perform TLS handshake before the HTTP request to secure the connection
 
 The HTTP server now default to serve securely so if want to perform quickstart guide, please change the IsSecure variable from true to false then rerun go build command
